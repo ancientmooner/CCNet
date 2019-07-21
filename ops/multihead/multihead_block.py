@@ -17,7 +17,11 @@ class MultiheadBlock(nn.Module):
                  pooling_type='att',
                  fusion_types=('channel_add', ),
                  head_num=4,
-                 one_fc=False):
+                 one_fc=False,
+                 norm_type='layer',
+                 att_group=1,
+                 value_pre_group=1,
+                 value_post_group=4):
         super(MultiheadBlock, self).__init__()
         assert pooling_type in ['avg', 'att']
         assert isinstance(fusion_types, (list, tuple))
@@ -30,16 +34,23 @@ class MultiheadBlock(nn.Module):
         self.pooling_type = pooling_type
         self.fusion_types = fusion_types
         self.head_num = head_num
+        self.att_group = att_group
+        self.value_pre_group = value_pre_group
+        self.value_post_group = value_post_group
         if pooling_type == 'att':
-            self.conv_mask = nn.Conv2d(inplanes, self.head_num, kernel_size=1, groups=self.head_num)
+            self.conv_mask = nn.Conv2d(inplanes, self.head_num, kernel_size=1, groups=self.att_group)
             self.softmax = nn.Softmax(dim=2)
         else:
             self.avg_pool = nn.AdaptiveAvgPool2d(1)
         if 'channel_add' in fusion_types:
             if one_fc:
-                self.channel_add_conv=nn.Sequential(
-                    nn.Conv2d(self.inplanes, self.inplanes, kernel_size=1),
-                    nn.LayerNorm([self.inplanes, 1, 1]))
+                if norm_type == 'layer':
+                    self.channel_add_conv=nn.Sequential(
+                        nn.Conv2d(self.inplanes * self.value_post_group, self.inplanes, kernel_size=1, groups=self.value_post_group),                    
+                            nn.LayerNorm([self.inplanes, 1, 1]))
+                else:
+                    self.channel_add_conv=nn.Sequential(
+                        nn.Conv2d(self.inplanes * self.value_post_group, self.inplanes, kernel_size=1, groups=self.value_post_group),)
             else:
                 self.channel_add_conv = nn.Sequential(
                     nn.Conv2d(self.inplanes, self.planes, kernel_size=1),
@@ -75,11 +86,15 @@ class MultiheadBlock(nn.Module):
 
     def spatial_pool(self, x):
         batch, channel, height, width = x.size()
+        # M: head_num
+        # AG: att_group
+        # preG: value_pre_group
+        # postG: value_post_group
         if self.pooling_type == 'att':
-            #[B, M, C/M, H, W]
-            input_x=x.view(batch,self.head_num,int(channel/self.head_num),height,width)
-            #[B, M, C/M, HW]
-            input_x=input_x.view(batch,self.head_num,int(channel/self.head_num),height*width)
+            #[B, preG, C/preG, H, W]
+            input_x=x.view(batch,self.value_pre_group,int(channel/self.value_pre_group),height,width)
+            #[B, preG, C/preG, HW]
+            input_x=input_x.view(batch,self.value_pre_group,int(channel/self.value_pre_group),height*width)
 
             #[B, M, H, W]
             context_mask=self.conv_mask(x)
@@ -91,10 +106,10 @@ class MultiheadBlock(nn.Module):
             context_mask=context_mask.unsqueeze(-1)
 
 
-            #[B, M, C/M, 1]
+            #[B, M, C/preG, 1]
             context=torch.matmul(input_x, context_mask)
-            #[B, C, 1, 1]
-            context=context.view(batch,channel,1,1)
+            #[B, M * C / preG, 1, 1]
+            context=context.view(batch,channel * self.head_num / self.value_pre_group,1,1)
         else:
             # [N, C, 1, 1]
             context = self.avg_pool(x)
